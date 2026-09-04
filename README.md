@@ -3,25 +3,25 @@ Iha hullu säännöt edelleen 1 ei tiivistelyjä placebo fake koodia keskeneräi
 
 ## MorphLabFE.lua
 
-FE-skripti, joka muuttaa oman hahmosi neljaksi eri olennoksi. Ei luo uusia parteja (100% FE, kaikki pelaajat nakevat).
+FE-skripti, joka muuttaa oman hahmosi. Ei luo uusia parteja.
 
-### Tekniikka (sama kuin Robloxin animaatioissa)
-1. Motor6D-liitosten C0-arvot asetetaan poseen. Luajan omistamat liitokset replikoituvat automaattisesti.
-2. Fysiikan solveri sijoittaa osat itse liitosten mukaan -> ei fysiikkataistelua, ei flingia.
-3. Lentoon BodyVelocity + yaw-only BodyGyro (sama kaava kuin toimivassa FE-drone-referenssissa).
-4. Jointit nollataan ensin kun moodi vaihtuu / skripti kaynnistyy, pose otetaan kayttoon seuraavassa framessa.
+### FE-replikointi (vahvistettu DevForum-tutkimuksella)
+- C0/C1/CFrame EIVAT replikoidu (vain fysiikka: position/velocity replikoituu)
+- Humanoidin Animatoriin ladatut ANIMAATIOT replikoituvat kaikille automaattisesti
+- Siksi HELI ja MONSTER kayttavat julkaistuja emote-animaatioita -> nakyvat kaikille
+- BUNNY/DOG: ei julkaistua assetia -> lokaali joint-pose (nakyy omalla ruudulla)
 
-### Moodit
-- HELICOPTER: runko makuulle (root-joint), paa=ohjaamo, o.kasi=masto, o.jalka=paapotkuri (pyorii), v.kasi=hantapuomi, v.jalka=hantapotkuri. Special: CRASHOUT.
-- BUNNY: kadet=jousitetut korvat, jalat=potkujalat, pomppufysiikka squash & stretch. Special: THUMP.
-- DOG: neljajalkainen vaakatasossa, vinottainen rava-askel, lorskahdus. Special: BOW.
-- MONSTER: kumartunut keinuva hahmo, pitkat kadet. Special: ROAR.
+### Animaatiot (loopissa koko ajan kun moodi paalla)
+- HELI = "Helicopter" emote (110553756436163) - replikoituu kaikille
+- MONSTER = "Pain of Pains" emote (132985306809464) - replikoituu kaikille
+- Muokkaus: animspeed skaalautuu liikenopeuteen (AdjustSpeed)
 
-### Ohjaus
-- WASD / joystick = ohjaa suuntaa (leijuu paikallaan ilman inputtia)
-- ASCEND / DESCEND -napit hypynapin viereen (PC:lla SPACE / CTRL)
+### Lento (todistettu FE-drone-kaava, ei flingia)
+- BodyVelocity + yaw-only BodyGyro (P=9000)
+- Raajoja ei siirreta kauas jointeista (se aiheutti flingin)
+- ASCEND/DESCEND-napit hypynapin viereen (PC: SPACE/CTRL)
 - Lattia-raycast: laskeutuminen pysahtyy maahan
 
 ### GUI (englanniksi, ei emojeita)
 - Lapinakyva, raahattava, pienennettava (-), suljettava (X, RightShift avaa)
-- Moodipillit, ENABLE/DISABLE, SPECIAL-efekti, statusrivi
+- Moodipillit, ENABLE/DISABLE, SPECIAL-efekti, statusrivi (nayttaa ANIM/LOCAL)

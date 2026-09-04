@@ -1,22 +1,25 @@
 --============================================================--
---  MORPH LAB FE (v5) - muuttaa hahmosi ajoneuvoiksi / elaimiksi
+--  MORPH LAB FE (v7) - muuttaa hahmosi ajoneuvoiksi / elaimiksi
 --
---  100% FE: ei luoda yhtaan uutta partia. Raajojen CFramet
---  asetetaan joka frame; luaja omistaa hahmonsa osien physics-
---  omistajuuden, joten muutokset replikoituvat kaikille.
+--  100% FE - ja nyt TODELLAKIN kaikille nakyva:
+--    HELI ja MONSTER kayttavat julkaistuja emote-animaatioita.
+--    Humanoidin Animatoriin ladatut animaatiot REPLIKOITUVAT
+--    kaikille pelaajille automaattisesti (Robloxin sisainen
+--    animaatioreplikointi) - tata ei voi tehda C0/CFrame-asetuksilla,
+--    koska ne eivat koskaan replikoidu (vahvistettu DevForum).
 --
---  MIKSI TAMA ON VAKAA (oppia aiemmista versioista):
---    - BodyGyro ohjaa VAIN yaw'ta (todistettu FE-drone-kaava).
---      Rungon kallistus tulee osien omista asennoista.
---    - Kaikki osat sijoitetaan dirFrame()-matematiikalla:
---      keskipiste + suuntavektori. Orientaatio on siten
---      rakenteellisesti oikein - koskaan ei arvailla kulmia.
---    - Fysiikka pyorii Heartbeatissa (fysiikan jalkeen),
---      pose Steppedissa (ennen fysiikkaa) -> ei taistelua.
---    - Nopeus clampattu, NaN-suojat, lattia-raycast.
---    - Exekuuttori-kompat: kaikki I/O pcall-kuoressa.
+--  ANIMAATIOT (koko ajan loopissa kun moodi paalla):
+--    HELI    = "Helicopter" emote (110553756436163)
+--    MONSTER = "Pain of Pains" emote (132985306809464)
+--    BUNNY/DOG = ei julkaistua assetia -> lokaali joint-pose
+--                (nakyvat omalla ruudulla, liike kaikille)
 --
---  RIGIT: R6 ensisijainen, R15 varavirta (raajaketjut).
+--  MUOKKAUS: animspeed skaalautuu liikenopeuteen (AdjustSpeed),
+--    potkuri-/korva-/askelparametrit CFG:ssa.
+--
+--  LENTO: todistettu FE-drone-kaava - BodyVelocity +
+--    yaw-only BodyGyro (P=9000). Ei flingia koska emme siirra
+--    raajoja kauas jointeista emmeka kaanna gyron pitchia.
 --
 --  OHJAUS:
 --    WASD / joystick = ohjaa suuntaa (leijuu paikallaan)
@@ -35,31 +38,34 @@ local player = Players.LocalPlayer
 
 --====================== ASETUKSET ===========================--
 local CFG = {
+	-- animaatio-ID:t (emote -> sisainen Animation)
+	AnimIds = {
+		HELI    = "110553756436163",
+		MONSTER = "132985306809464",
+	},
+	-- animspeed-rajat (muokkaus: nopeus skaalautuu liikkeeseen)
+	AnimSpeedBase = 1.0,
+	AnimSpeedGain = 0.6,   -- kuinka paljon liikenopeus kiihdyttaa animia
+	AnimSpeedMax  = 2.2,
+	-- heli
 	ForwardSpeed   = 30,
 	BackwardSpeed  = 14,
 	ClimbSpeed     = 18,
 	DescendSpeed   = 16,
 	Acceleration   = 4,
-	ForwardTilt    = 20,
-	BankTilt       = 12,
 	HoverBob       = 0.6,
-	MainRotorIdle  = 8,
-	MainRotorMax   = 28,
-	MainRotorMin   = 4,
-	TailRotorIdle  = 7,
-	TailRotorMax   = 28,
-	TailRotorGain  = 0.9,
-	RotorResponse  = 2.4,
+	-- pupu
 	BunnySpeed     = 24,
 	BunnyHop       = 12,
 	BunnyFall      = -6,
 	BunnyBigJump   = 15,
-	BunnyLean      = 26,
 	EarStiffness   = 110,
 	EarDamping     = 9,
 	EarAccelGain   = 0.0016,
+	-- koira
 	DogSpeed       = 34,
 	DogLeap        = 13,
+	-- monsteri
 	MonsterSpeed   = 11,
 	MonsterSlam    = 10,
 	GroundClear    = { HELI = 2.2, BUNNY = 2.0, DOG = 2.1, MONSTER = 2.9 },
@@ -81,10 +87,6 @@ local state = {
 	special     = false,
 	specialT    = 0,
 	elapsed     = 0,
-	rotorAngle  = 0,
-	tailAngle   = 0,
-	mainSpeed   = CFG.MainRotorIdle,
-	tailSpeed   = CFG.TailRotorIdle,
 	velocity    = Vector3.zero,
 	upHeld      = false,
 	downHeld    = false,
@@ -99,10 +101,14 @@ local state = {
 }
 
 local isR15 = false
-local P = {} -- osat
-local char, humanoid, animator, animateScript
+local char, humanoid, hrp, animator, animateScript
 local bodyVelocity, bodyGyro
 local rng = Random.new()
+
+local J = {}      -- liitokset (vain BUNNY/DOG lokaaliposeihin)
+local orig = {}
+local animTracks = {}  -- [modeId] = AnimationTrack (ladatut)
+local activeTrack = nil -- tama saa jaada soimaan stopAnimationsissa
 
 --====================== APURIT ==============================--
 local function damp(a, b, k, dt)
@@ -113,8 +119,8 @@ local function dampV3(a, b, k, dt)
 	return a:Lerp(b, 1 - math.exp(-k * dt))
 end
 
-local function shakeCF(posMag, rotMag)
-	return CFrame.new(
+local function wobble(cf, posMag, rotMag)
+	return cf * CFrame.new(
 		(rng:NextNumber() - 0.5) * 2 * posMag,
 		(rng:NextNumber() - 0.5) * 2 * posMag,
 		(rng:NextNumber() - 0.5) * 2 * posMag
@@ -125,65 +131,144 @@ local function shakeCF(posMag, rotMag)
 	)
 end
 
-local function validCF(cf)
-	local p = cf.Position
-	return p.X == p.X and p.Y == p.Y and p.Z == p.Z
-		and math.abs(p.X) < 1e5 and math.abs(p.Y) < 1e5 and math.abs(p.Z) < 1e5
-end
-
--- frame jonka -Y osoittaa suuntaan dir: osan pitka akseli (Y)
--- asettuu suuntaan. Tama on RAKENTEELLISESTI oikea orientaatio.
-local function dirFrame(pos, dir)
-	if math.abs(dir.Y) > 0.999 then
-		dir = (dir + Vector3.new(1e-3, 0, 0)).Unit
+-- pysayta kaikki PAITSIN oma aktivinen morffi-animmme
+local function stopAnimations()
+	if not animator then return end
+	for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+		if track ~= activeTrack then
+			track:Stop(0)
+		end
 	end
-	return CFrame.lookAt(pos, pos + dir) * CFrame.Angles(math.rad(90), 0, 0)
 end
 
--- asettaa osaketjun perakkain root-framen -Y suuntaan,
--- palauttaa viimeisen osan framen
-local function chain(root, parts)
-	local cur = root
-	local prevHalf = 0
-	for _, part in ipairs(parts) do
-		cur = cur * CFrame.new(0, -(prevHalf + part.Size.Y / 2), 0)
-		part.CFrame = cur
-		prevHalf = part.Size.Y / 2
+--============================================================--
+--              ANIMAATIOIDEN LATAUS (FE-replikoituva)
+--============================================================--
+-- Katalogi-emote: sisainen Animation etsitaan kuten toimivassa
+-- FE-drone-referenssissa; fallback = suora rbxassetid.
+local function resolveAnimation(assetId)
+	local targetId = "rbxassetid://" .. assetId
+
+	-- 1) GetObjects (exekuuttori-tuki, kuten referenssissa)
+	local ok, objects = pcall(function()
+		return game:GetObjects(targetId)
+	end)
+	if ok and objects then
+		for _, obj in ipairs(objects) do
+			if obj:IsA("Animation") then
+				return obj.AnimationId
+			end
+			for _, desc in ipairs(obj:GetDescendants()) do
+				if desc:IsA("Animation") then
+					return desc.AnimationId
+				end
+			end
+		end
 	end
-	return cur
+
+	-- 2) suora ID (emoteilla katalogi-ID toimii animaationa)
+	return targetId
 end
 
+local function getAnimTrack(modeId)
+	if animTracks[modeId] then
+		return animTracks[modeId]
+	end
+	local assetId = CFG.AnimIds[modeId]
+	if not assetId or not animator then return nil end
+
+	local ok, track = pcall(function()
+		local anim = Instance.new("Animation")
+		anim.AnimationId = resolveAnimation(assetId)
+		local t = animator:LoadAnimation(anim)
+		t.Looped = true
+		t.Priority = Enum.AnimationPriority.Action4 -- voittaa oletusanimit
+		return t
+	end)
+	if ok and track then
+		animTracks[modeId] = track
+		return track
+	end
+	return nil
+end
+
+--====================== RIGIN SITOMINEN =====================--
 local function bindCharacter(c)
 	char = c
 	humanoid = c:WaitForChild("Humanoid")
-	P = {}
-	P.hrp = c:WaitForChild("HumanoidRootPart")
-	P.head = c:WaitForChild("Head")
+	hrp = c:WaitForChild("HumanoidRootPart")
 	isR15 = humanoid.RigType == Enum.HumanoidRigType.R15
 
+	J = {}
+	orig = {}
+	animTracks = {}
+	activeTrack = nil
+
+	local function grab(motor, key)
+		orig[motor] = { c0 = motor.C0, c1 = motor.C1 }
+		J[key] = motor
+	end
+
 	if isR15 then
-		P.torso = c:WaitForChild("UpperTorso")
-		P.lowerTorso = c:WaitForChild("LowerTorso")
-		P.armRChain = { c:WaitForChild("RightUpperArm"), c:WaitForChild("RightLowerArm"), c:WaitForChild("RightHand") }
-		P.armLChain = { c:WaitForChild("LeftUpperArm"), c:WaitForChild("LeftLowerArm"), c:WaitForChild("LeftHand") }
-		P.legRChain = { c:WaitForChild("RightUpperLeg"), c:WaitForChild("RightLowerLeg"), c:WaitForChild("RightFoot") }
-		P.legLChain = { c:WaitForChild("LeftUpperLeg"), c:WaitForChild("LeftLowerLeg"), c:WaitForChild("LeftFoot") }
+		local lower = c:WaitForChild("LowerTorso")
+		local upper = c:WaitForChild("UpperTorso")
+		grab(hrp:WaitForChild("RootJoint"), "root")
+		grab(upper:WaitForChild("Neck"), "neck")
+		grab(upper:WaitForChild("RightShoulder"), "shoulderR")
+		grab(upper:WaitForChild("LeftShoulder"), "shoulderL")
+		grab(lower:WaitForChild("RightHip"), "hipR")
+		grab(lower:WaitForChild("LeftHip"), "hipL")
+		grab(c:WaitForChild("RightUpperArm"):WaitForChild("RightElbow"), "elbowR")
+		grab(c:WaitForChild("LeftUpperArm"):WaitForChild("LeftElbow"), "elbowL")
+		grab(c:WaitForChild("RightUpperLeg"):WaitForChild("RightKnee"), "kneeR")
+		grab(c:WaitForChild("LeftUpperLeg"):WaitForChild("LeftKnee"), "kneeL")
 	else
-		P.torso = c:WaitForChild("Torso")
-		P.armR = c:WaitForChild("Right Arm")
-		P.armL = c:WaitForChild("Left Arm")
-		P.legR = c:WaitForChild("Right Leg")
-		P.legL = c:WaitForChild("Left Leg")
+		local torso = c:WaitForChild("Torso")
+		grab(torso:WaitForChild("RootJoint"), "root")
+		grab(torso:WaitForChild("Neck"), "neck")
+		grab(torso:WaitForChild("Right Shoulder"), "shoulderR")
+		grab(torso:WaitForChild("Left Shoulder"), "shoulderL")
+		grab(torso:WaitForChild("Right Hip"), "hipR")
+		grab(torso:WaitForChild("Left Hip"), "hipL")
 	end
 
 	animator = humanoid:WaitForChild("Animator")
 	animateScript = c:FindFirstChild("Animate")
 end
 
-local function stopAnimations()
-	if not animator then return end
-	for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-		track:Stop(0)
+local function restoreJoints()
+	for motor, o in pairs(orig) do
+		if motor and motor.Parent then
+			pcall(function()
+				motor.C0 = o.c0
+				motor.C1 = o.c1
+			end)
+		end
+	end
+end
+
+--====================== ANIMAATIO-OHJ AUS ===================--
+local function playModeAnim(modeId)
+	-- pysayta vanha
+	if activeTrack then
+		pcall(function() activeTrack:Stop(0.1) end)
+		activeTrack = nil
+	end
+	-- jos moodilla on julkaistu animaatio, kayta sita (replikoituu!)
+	local track = getAnimTrack(modeId)
+	if track then
+		activeTrack = track
+		pcall(function()
+			track:Play(0.1)
+			track:AdjustSpeed(CFG.AnimSpeedBase)
+		end)
+	end
+end
+
+local function stopModeAnim()
+	if activeTrack then
+		pcall(function() activeTrack:Stop(0.1) end)
+		activeTrack = nil
 	end
 end
 
@@ -216,8 +301,6 @@ local function enable()
 	state.specialT = 0
 	state.elapsed = 0
 	state.velocity = Vector3.zero
-	state.mainSpeed = CFG.MainRotorIdle
-	state.tailSpeed = CFG.TailRotorIdle
 	state.earAngle, state.earVel = 0, 0
 	state.hopPhase, state.gaitPhase = 0, 0
 	state.thumpPulse = 0
@@ -229,8 +312,8 @@ local function enable()
 	humanoid.AutoRotate = false
 
 	pcall(function()
-		P.hrp.AssemblyLinearVelocity = Vector3.zero
-		P.hrp.AssemblyAngularVelocity = Vector3.zero
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
 	end)
 
 	destroyMovers()
@@ -238,15 +321,18 @@ local function enable()
 	bodyVelocity = Instance.new("BodyVelocity")
 	bodyVelocity.Velocity = Vector3.zero
 	bodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-	bodyVelocity.Parent = P.hrp
+	bodyVelocity.Parent = hrp
 
 	bodyGyro = Instance.new("BodyGyro")
 	bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
 	bodyGyro.P = 9000
-	local lk = P.hrp.CFrame.LookVector
-	bodyGyro.CFrame = CFrame.new(P.hrp.Position,
-		P.hrp.Position + Vector3.new(lk.X, 0, lk.Z))
-	bodyGyro.Parent = P.hrp
+	local lk = hrp.CFrame.LookVector
+	bodyGyro.CFrame = CFrame.new(hrp.Position,
+		hrp.Position + Vector3.new(lk.X, 0, lk.Z))
+	bodyGyro.Parent = hrp
+
+	-- kaynnista moodin animaatio (FE-replikoituva jos julkaistu)
+	playModeAnim(state.mode)
 
 	if ascendBtn then
 		ascendBtn.Visible = true
@@ -269,12 +355,14 @@ local function disable()
 	state.upHeld = false
 	state.downHeld = false
 
+	stopModeAnim()
 	destroyMovers()
+	restoreJoints()
 
 	if humanoid and humanoid.Parent then
 		pcall(function()
-			P.hrp.AssemblyLinearVelocity = Vector3.zero
-			P.hrp.AssemblyAngularVelocity = Vector3.zero
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
 		end)
 		humanoid.PlatformStand = false
 		humanoid.AutoRotate = true
@@ -300,182 +388,51 @@ local function triggerSpecial()
 end
 
 --============================================================--
---                     POSEN MUOTOILU
+--        LOKAALIT POSET vain BUNNY/DOG (ei julkaistua animia)
 --============================================================--
--- base = P.hrp.CFrame (yaw-only: pysty, katsoo kulkusuuntaan).
--- base:VectorToWorldSpace muuntaa lokaalin suunnan maailmaan.
-
-local function poseHeli(base, t)
-	local crash = state.special
-
-	-- helikopterin runko kallistuu nokasta alas kiihdytettaessa
-	local fwd = math.clamp(state.velocity.Magnitude / CFG.ForwardSpeed, 0, 1)
-	local tilt = math.rad(CFG.ForwardTilt) * fwd
-	if crash then
-		tilt = tilt + math.rad(8) * math.sin(t * 9)
-	end
-	-- vartalo: makaa vaakatasossa. +Y(nokka) on kulkusuunnassa
-	-- hieman alaspain tilttin verran.
-	local noseW = base:VectorToWorldSpace(Vector3.new(0, 1, 0))
-	local upW   = base:VectorToWorldSpace(Vector3.new(0, 0, 1))
-	local rightW = base:VectorToWorldSpace(Vector3.new(1, 0, 0))
-
-	-- runko: CFrame jossa paa "paikallaan" mutta vartalo kallistettu
-	local torsoCF = base
-		* CFrame.new(0, 0.5, -1.0)
-		* CFrame.Angles(math.rad(-90) + tilt, 0, 0)
-	if crash then torsoCF = torsoCF * shakeCF(0.08, 0.07) end
-	if isR15 then
-		P.torso.CFrame = torsoCF
-		P.lowerTorso.CFrame = torsoCF * CFrame.new(0, -0.55, 0.05)
-	else
-		P.torso.CFrame = torsoCF
-	end
-
-	-- paa = ohjaamo: vartalon etupaassa, katsoo kulkusuuntaan
-	local headPos = (torsoCF * CFrame.new(0, 1.35, 0.25)).Position
-	if crash then
-		P.head.CFrame = CFrame.lookAt(headPos, headPos - noseW)
-			* CFrame.Angles(math.rad(-30) + math.rad(6) * math.sin(t * 16), 0, 0)
-			* shakeCF(0.05, 0.08)
-	else
-		P.head.CFrame = CFrame.lookAt(headPos, headPos + noseW)
-	end
-
-	-- masto: selasta ylos (vartalon ylapinnasta)
-	local mastRoot = (torsoCF * CFrame.new(0, 0, 0.95)).Position
-	local mastDir = upW
-	if crash then
-		mastDir = (upW * -0.9 + noseW * -0.4).Unit
-	else
-		mastDir = (upW + noseW * (0.04 * math.sin(t * 2.3))).Unit
-	end
-
-	-- paapotkuri: maston paassa, lapa pyorii
-	local mastTip
-	if isR15 then
-		local mastEnd = chain(dirFrame(mastRoot, mastDir), P.armRChain)
-		mastTip = (mastEnd * CFrame.new(0, -0.5, 0)).Position
-	else
-		P.armR.CFrame = dirFrame(mastRoot + mastDir * 1.0, mastDir)
-		mastTip = mastRoot + mastDir * 2.05
-	end
-
-	-- lapa pyorii nokka-oikea -tasossa (vaakataso rungon nahden)
-	local bladeDir = (noseW * math.cos(state.rotorAngle)
-		+ rightW * math.sin(state.rotorAngle))
-	if isR15 then
-		chain(dirFrame(mastTip, bladeDir), P.legRChain)
-	else
-		P.legR.CFrame = dirFrame(mastTip, bladeDir)
-	end
-
-	-- hantapuomi: takana osoittaa taakse
-	local boomRoot = (torsoCF * CFrame.new(0, -1.0, 0.1)).Position
-	local boomDir = -noseW
-	if crash then
-		boomDir = (-noseW + upW * -0.35).Unit
-	end
-	local boomTip
-	if isR15 then
-		local boomEnd = chain(dirFrame(boomRoot, boomDir), P.armLChain)
-		boomTip = (boomEnd * CFrame.new(0, -0.5, 0)).Position
-	else
-		P.armL.CFrame = dirFrame(boomRoot + boomDir * 1.0, boomDir)
-		boomTip = boomRoot + boomDir * 2.05
-	end
-
-	-- hantapotkuri: pyorii oikea-ylos -tasossa (pystytaso)
-	local tailBladeDir = (rightW * math.cos(state.tailAngle)
-		+ upW * math.sin(state.tailAngle))
-	if isR15 then
-		chain(dirFrame(boomTip, tailBladeDir), P.legLChain)
-	else
-		P.legL.CFrame = dirFrame(boomTip, tailBladeDir)
-	end
-end
-
-local function poseBunny(base, t)
+local function poseBunny(t)
 	local lift = state.liftPos
 	local sq = state.squash
 	local earBack = 0.22 + state.earAngle
-	local twitchY = math.rad(3) * math.sin(t * 1.7) + math.rad(1.5) * math.sin(t * 5.3)
-	local headP = math.rad(4) * math.sin(t * 2.9)
+	local twitch = math.rad(3) * math.sin(t * 1.7) + math.rad(1.5) * math.sin(t * 5.3)
 
 	if state.special then
 		sq = sq + 0.15 * math.abs(math.sin(state.specialT * 14))
 	end
 
-	-- korvasuunnat: ylos ja hieman taakse, sivulle vino
-	local earDirL = (base:VectorToWorldSpace(
-		Vector3.new(-0.16, math.cos(earBack), math.sin(earBack)))).Unit
-	local earDirR = (base:VectorToWorldSpace(
-		Vector3.new(0.16, math.cos(earBack), math.sin(earBack)))).Unit
+	J.root.C0 = CFrame.new(0, -sq * 0.6, 0)
+	J.neck.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(-8), twitch, 0)
 
-	-- jalat: kyykky (taakse) <-> ojennus (alas)
-	local legDir = (base:VectorToWorldSpace(
-		Vector3.new(0, -0.95 + 0.55 * (1 - lift), 0.3 + 0.6 * (1 - lift)))).Unit
+	J.shoulderR.C0 = CFrame.new(0.35, 0.55, 0)
+		* CFrame.Angles(-earBack * 0.6, 0, math.rad(172))
+	J.shoulderL.C0 = CFrame.new(-0.35, 0.55, 0)
+		* CFrame.Angles(-earBack * 0.6, 0, math.rad(-172))
+
+	local fold = math.rad(120 - 90 * lift)
+	J.hipR.C0 = CFrame.new(0.25, -0.9, 0) * CFrame.Angles(fold, 0, 0)
+	J.hipL.C0 = CFrame.new(-0.25, -0.9, 0) * CFrame.Angles(fold, 0, 0)
 
 	if isR15 then
-		P.lowerTorso.CFrame = base * CFrame.new(0, -sq, 0)
-		P.torso.CFrame = base * CFrame.new(0, 0.55 - sq, -0.02)
-		P.head.CFrame = base * CFrame.new(0, 1.32 - sq, -0.08)
-			* CFrame.Angles(headP, twitchY, 0)
-
-		local earRootL = (base * CFrame.new(-0.28, 1.18 - sq, 0.12)).Position
-		local earRootR = (base * CFrame.new(0.28, 1.18 - sq, 0.12)).Position
-		chain(dirFrame(earRootL, earDirL), P.armLChain)
-		chain(dirFrame(earRootR, earDirR), P.armRChain)
-
-		local hipL = (base * CFrame.new(-0.42, -0.55 - sq, 0.05)).Position
-		local hipR = (base * CFrame.new(0.42, -0.55 - sq, 0.05)).Position
-		chain(dirFrame(hipL, legDir), P.legLChain)
-		chain(dirFrame(hipR, legDir), P.legRChain)
-	else
-		P.torso.CFrame = base * CFrame.new(0, -sq, 0)
-		P.head.CFrame = base * CFrame.new(0, 1.5 - sq, -0.08)
-			* CFrame.Angles(headP, twitchY, 0)
-
-		local earCenterL = (base * CFrame.new(-0.32, 1.05 - sq, 0.12)).Position + earDirL * 1.0
-		local earCenterR = (base * CFrame.new(0.32, 1.05 - sq, 0.12)).Position + earDirR * 1.0
-		P.armL.CFrame = dirFrame(earCenterL, earDirL)
-		P.armR.CFrame = dirFrame(earCenterR, earDirR)
-
-		local legCenterL = (base * CFrame.new(-0.5, -0.62 - sq, 0.08)).Position + legDir * 1.0
-		local legCenterR = (base * CFrame.new(0.5, -0.62 - sq, 0.08)).Position + legDir * 1.0
-		P.legL.CFrame = dirFrame(legCenterL, legDir)
-		P.legR.CFrame = dirFrame(legCenterR, legDir)
+		local knee = math.rad(70 - 60 * lift)
+		J.kneeR.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(knee, 0, 0)
+		J.kneeL.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(knee, 0, 0)
 	end
 end
 
-local function poseDog(base, t)
+local function poseDog(t)
 	local g = state.gaitPhase * math.pi * 2
 	local swing = math.sin(g) * 0.55
 	local pant = math.rad(5) * math.sin(t * 6)
 	local bow = state.special
 
-	-- runko vaakatasoon (neljajalkainen)
 	local pitch = math.rad(-72)
 	if state.downHeld then pitch = math.rad(-40) end
 	if bow then pitch = math.rad(-88) end
-	local torsoCF = base * CFrame.new(0, 0.3, -0.5) * CFrame.Angles(pitch, 0, 0)
+	J.root.C0 = CFrame.new(0, -0.15, 0) * CFrame.Angles(pitch, 0, 0)
 
-	local noseW = torsoCF:VectorToWorldSpace(Vector3.new(0, 1, 0))
-	local upW   = torsoCF:VectorToWorldSpace(Vector3.new(0, 0, 1))
+	J.neck.C0 = CFrame.new(0, 0, 0)
+		* CFrame.Angles(math.rad(55) + pant, math.rad(4) * math.sin(t * 2.2), 0)
 
-	if isR15 then
-		P.lowerTorso.CFrame = torsoCF * CFrame.new(0, -0.5, 0.05)
-		P.torso.CFrame = torsoCF
-	else
-		P.torso.CFrame = torsoCF
-	end
-
-	-- paa: nokassa, ylos ja eteen, lorskahdus
-	local headPos = (torsoCF * CFrame.new(0, 1.15, 0.25)).Position
-	P.head.CFrame = CFrame.lookAt(headPos, headPos + noseW)
-		* CFrame.Angles(pant, math.rad(4) * math.sin(t * 2.2), 0)
-
-	-- jalat: alas + keinu eteen/taakse (vinottainen rava)
 	local fR, fL = swing, -swing
 	local bR, bL = -swing, swing
 	if bow then
@@ -483,124 +440,37 @@ local function poseDog(base, t)
 		bR = 0.25 * math.sin(t * 14)
 		bL = 0.25 * math.sin(t * 14 + 1)
 	end
-	local downW = -upW
-	local function legDir(s)
-		return (downW + noseW * s).Unit
-	end
+
+	J.shoulderR.C0 = CFrame.new(0.4, 0.5, 0) * CFrame.Angles(fR, 0, math.rad(90))
+	J.shoulderL.C0 = CFrame.new(-0.4, 0.5, 0) * CFrame.Angles(fL, 0, math.rad(-90))
+	J.hipR.C0 = CFrame.new(0.25, -0.9, 0) * CFrame.Angles(bR, 0, 0)
+	J.hipL.C0 = CFrame.new(-0.25, -0.9, 0) * CFrame.Angles(bL, 0, 0)
 
 	if isR15 then
-		local shL = (torsoCF * CFrame.new(-0.5, 0.55, -0.25)).Position
-		local shR = (torsoCF * CFrame.new(0.5, 0.55, -0.25)).Position
-		local hipL = (torsoCF * CFrame.new(-0.5, -0.5, -0.25)).Position
-		local hipR = (torsoCF * CFrame.new(0.5, -0.5, -0.25)).Position
-		chain(dirFrame(shL, legDir(fL)), P.armLChain)
-		chain(dirFrame(shR, legDir(fR)), P.armRChain)
-		chain(dirFrame(hipL, legDir(bL)), P.legLChain)
-		chain(dirFrame(hipR, legDir(bR)), P.legRChain)
-	else
-		P.armR.CFrame = dirFrame(
-			(torsoCF * CFrame.new(0.55, 0.7, -0.25)).Position + legDir(fR) * 1.0, legDir(fR))
-		P.armL.CFrame = dirFrame(
-			(torsoCF * CFrame.new(-0.55, 0.7, -0.25)).Position + legDir(fL) * 1.0, legDir(fL))
-		P.legR.CFrame = dirFrame(
-			(torsoCF * CFrame.new(0.5, -0.7, -0.25)).Position + legDir(bR) * 1.0, legDir(bR))
-		P.legL.CFrame = dirFrame(
-			(torsoCF * CFrame.new(-0.5, -0.7, -0.25)).Position + legDir(bL) * 1.0, legDir(bL))
-	end
-end
-
-local function poseMonster(base, t)
-	local g = state.gaitPhase * math.pi * 2
-	local sway = math.rad(4) * math.sin(t * 1.4)
-	local armSwing = math.sin(g) * 0.22
-	local legSwing = math.sin(g) * 0.18
-	local roar = state.special
-
-	-- runko: pysty, hieman kumara
-	local torsoCF = base * CFrame.new(0, 0, 0)
-		* CFrame.Angles(math.rad(-18), 0, sway)
-
-	if isR15 then
-		P.lowerTorso.CFrame = torsoCF
-		P.torso.CFrame = torsoCF * CFrame.new(0, 0.55, -0.04)
-	else
-		P.torso.CFrame = torsoCF
-	end
-
-	local fwdW = base:VectorToWorldSpace(Vector3.new(0, 0, -1))
-	local upW  = base:VectorToWorldSpace(Vector3.new(0, 1, 0))
-
-	-- paa: alhaalla eteen tyontyneena
-	local headPos = (torsoCF * CFrame.new(0, 1.45, -0.3)).Position
-	if roar then
-		P.head.CFrame = CFrame.lookAt(headPos, headPos + upW)
-			* CFrame.Angles(math.rad(-40) + math.rad(5) * math.sin(t * 20), 0, 0)
-			* shakeCF(0.05, 0.06)
-	else
-		P.head.CFrame = CFrame.lookAt(headPos, headPos + fwdW)
-			* CFrame.Angles(math.rad(24), sway, 0)
-	end
-
-	if roar then
-		-- kadet ylos
-		local armDirL = (base:VectorToWorldSpace(Vector3.new(-0.25, 1, 0.15))).Unit
-		local armDirR = (base:VectorToWorldSpace(Vector3.new(0.25, 1, 0.15))).Unit
-		local shL = (torsoCF * CFrame.new(-0.85, 0.85, -0.05)).Position
-		local shR = (torsoCF * CFrame.new(0.85, 0.85, -0.05)).Position
-		if isR15 then
-			chain(dirFrame(shL, armDirL), P.armLChain)
-			chain(dirFrame(shR, armDirR), P.armRChain)
-		else
-			P.armL.CFrame = dirFrame(shL + armDirL * 1.0, armDirL)
-			P.armR.CFrame = dirFrame(shR + armDirR * 1.0, armDirR)
-		end
-	else
-		-- kadet pitkina roikkumaan eteen-alas
-		local armDirL = (base:VectorToWorldSpace(Vector3.new(-0.12, -0.5, -0.85 - armSwing))).Unit
-		local armDirR = (base:VectorToWorldSpace(Vector3.new(0.12, -0.5, -0.85 + armSwing))).Unit
-		local shL = (torsoCF * CFrame.new(-0.85, 0.85, -0.08)).Position
-		local shR = (torsoCF * CFrame.new(0.85, 0.85, -0.08)).Position
-		if isR15 then
-			chain(dirFrame(shL, armDirL), P.armLChain)
-			chain(dirFrame(shR, armDirR), P.armRChain)
-		else
-			P.armL.CFrame = dirFrame(shL + armDirL * 1.0, armDirL)
-			P.armR.CFrame = dirFrame(shR + armDirR * 1.0, armDirR)
-		end
-	end
-
-	-- jalat: raskas keinu
-	local legDirL = (base:VectorToWorldSpace(Vector3.new(0, -1, legSwing))).Unit
-	local legDirR = (base:VectorToWorldSpace(Vector3.new(0, -1, -legSwing))).Unit
-	local hipL = (torsoCF * CFrame.new(-0.45, -0.5, 0)).Position
-	local hipR = (torsoCF * CFrame.new(0.45, -0.5, 0)).Position
-	if isR15 then
-		chain(dirFrame(hipL, legDirL), P.legLChain)
-		chain(dirFrame(hipR, legDirR), P.legRChain)
-	else
-		P.legL.CFrame = dirFrame(hipL + legDirL * 1.0, legDirL)
-		P.legR.CFrame = dirFrame(hipR + legDirR * 1.0, legDirR)
+		J.elbowR.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(14), 0, 0)
+		J.elbowL.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(14), 0, 0)
+		J.kneeR.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(20), 0, 0)
+		J.kneeL.C0 = CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(20), 0, 0)
 	end
 end
 
 --============================================================--
---            HEARTBEAT-LUUPPI (liike + potkurit)
+--            HEARTBEAT-LUUPPI (liike + anim-nopeus)
 --============================================================--
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 RunService.Heartbeat:Connect(function(dt)
 	if not state.enabled then return end
-	if not P.hrp or P.hrp.Parent == nil or not humanoid or humanoid.Parent == nil then return end
+	if not hrp or hrp.Parent == nil or not humanoid or humanoid.Parent == nil then return end
 	if not bodyVelocity or bodyVelocity.Parent == nil then return end
 
 	state.elapsed = state.elapsed + dt
 	local t = state.elapsed
 
-	-- pakota pelin animaatiot pois myos taalla (Animate pyrkii
-	-- palaamaan framessa; Stepped-luuppi tekee saman ennen fysiikkaa)
 	stopAnimations()
 	if humanoid.Sit then humanoid.Sit = false end
+	if humanoid.SeatPart then humanoid.Sit = false end
 
 	local md = humanoid.MoveDirection
 	local flat = Vector3.new(md.X, 0, md.Z)
@@ -611,13 +481,12 @@ RunService.Heartbeat:Connect(function(dt)
 
 	-- lattia-raycast
 	rayParams.FilterDescendantsInstances = { char }
-	local hit = workspace:Raycast(P.hrp.Position, Vector3.new(0, -60, 0), rayParams)
+	local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -60, 0), rayParams)
 	local floorY = hit and hit.Position.Y or nil
 	local clearance = CFG.GroundClear[state.mode] or 2.2
 
-	-- kamera-suunta (tasoitettu) nopeuksien projektointiin
 	local cam = workspace.CurrentCamera
-	local camLook = cam and cam.CFrame.LookVector or P.hrp.CFrame.LookVector
+	local camLook = cam and cam.CFrame.LookVector or hrp.CFrame.LookVector
 	local flatLook = Vector3.new(camLook.X, 0, camLook.Z)
 	if flatLook.Magnitude < 1e-3 then flatLook = Vector3.new(0, 0, -1) end
 	flatLook = flatLook.Unit
@@ -641,21 +510,6 @@ RunService.Heartbeat:Connect(function(dt)
 			vertical = vertical + (rng:NextNumber() - 0.5) * 8
 		end
 		desired = flat * spd + Vector3.new(0, vertical, 0)
-
-		local fSpeed = state.velocity:Dot(flatLook)
-		local mainTarget = CFG.MainRotorIdle
-		if upInput then mainTarget = CFG.MainRotorMax
-		elseif downInput then mainTarget = CFG.MainRotorMin end
-		if state.special then mainTarget = 4 + 8 * math.abs(math.sin(t * 6.5)) end
-		local tailTarget = math.clamp(
-			CFG.TailRotorIdle + CFG.TailRotorGain * math.max(0, fSpeed), 0, CFG.TailRotorMax)
-		if state.special then
-			tailTarget = tailTarget * (0.4 + 0.6 * math.abs(math.sin(t * 9)))
-		end
-		state.mainSpeed = damp(state.mainSpeed, mainTarget, CFG.RotorResponse, dt)
-		state.tailSpeed = damp(state.tailSpeed, tailTarget, CFG.RotorResponse, dt)
-		state.rotorAngle = (state.rotorAngle + state.mainSpeed * dt) % (math.pi * 2)
-		state.tailAngle = (state.tailAngle + state.tailSpeed * dt) % (math.pi * 2)
 
 	elseif state.mode == "BUNNY" then
 		local hSpeed = downInput and 0 or CFG.BunnySpeed
@@ -734,7 +588,7 @@ RunService.Heartbeat:Connect(function(dt)
 
 	-- lattiaklampi
 	if floorY then
-		local heightAbove = P.hrp.Position.Y - floorY
+		local heightAbove = hrp.Position.Y - floorY
 		if heightAbove < clearance + 0.2 and desired.Y < 0 then
 			desired = Vector3.new(desired.X, 0, desired.Z)
 		end
@@ -746,13 +600,22 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	bodyVelocity.Velocity = state.velocity
 
-	-- gyro: VAIN yaw (todistettu drone-kaava)
+	-- gyro: VAIN yaw (drone-kaava)
 	if cam then
-		local pos = P.hrp.Position
+		local pos = hrp.Position
 		local target = CFrame.new(pos, pos + Vector3.new(flatLook.X, 0, flatLook.Z))
-		if validCF(target) then
+		if target.Position.X == target.Position.X then
 			bodyGyro.CFrame = target
 		end
+	end
+
+	-- MUOKKAUS: anim-nopeus skaalautuu liikenopeuteen
+	if activeTrack then
+		local mag = state.velocity.Magnitude
+		local speed = math.clamp(
+			CFG.AnimSpeedBase + (mag / math.max(CFG.ForwardSpeed, 1)) * CFG.AnimSpeedGain,
+			0, CFG.AnimSpeedMax)
+		pcall(function() activeTrack:AdjustSpeed(speed) end)
 	end
 
 	-- special-ajastin
@@ -765,44 +628,29 @@ RunService.Heartbeat:Connect(function(dt)
 
 	-- status
 	if statusLabel then
-		local extra = ""
-		if state.mode == "HELI" then
-			extra = string.format("  |  ROTOR %d%%", math.floor(state.mainSpeed / CFG.MainRotorMax * 100 + 0.5))
-		elseif state.mode == "BUNNY" then
-			extra = string.format("  |  HOP %d%%", math.floor(state.liftPos * 100 + 0.5))
-		end
+		local src = CFG.AnimIds[state.mode] and "ANIM" or "LOCAL"
 		statusLabel.Text = string.format(
-			"%s  |  %d studs/s%s",
-			modeInfo().name,
-			math.floor(state.velocity.Magnitude + 0.5),
-			extra
+			"%s [%s]  |  %d studs/s",
+			modeInfo().name, src,
+			math.floor(state.velocity.Magnitude + 0.5)
 		)
 	end
 end)
 
 --============================================================--
---              STEPPED-LUUPPI (pose, ennen fysiikkaa)
+--        RENDER-LUUPPI (vain BUNNY/DOG lokaalipose)
 --============================================================--
-RunService.Stepped:Connect(function()
+RunService.RenderStepped:Connect(function()
 	if not state.enabled then return end
-	if not P.hrp or P.hrp.Parent == nil or not humanoid or humanoid.Parent == nil then return end
+	if not hrp or hrp.Parent == nil or not humanoid or humanoid.Parent == nil then return end
 
-	stopAnimations()
-	if humanoid.Sit then humanoid.Sit = false end
-	if humanoid.SeatPart then humanoid.Sit = false end
-
-	local base = P.hrp.CFrame
-	if not validCF(base) then return end
+	-- HELI/MONSTER: julkaistu animaatio hoitaa posen (replikoituu).
+	-- BUNNY/DOG: ei assetia -> lokaali joint-pose.
 	local t = state.elapsed
-
-	if state.mode == "HELI" then
-		poseHeli(base, t)
-	elseif state.mode == "BUNNY" then
-		poseBunny(base, t)
+	if state.mode == "BUNNY" then
+		poseBunny(t)
 	elseif state.mode == "DOG" then
-		poseDog(base, t)
-	else
-		poseMonster(base, t)
+		poseDog(t)
 	end
 end)
 
@@ -997,6 +845,10 @@ for _, m in ipairs(MODES) do
 		state.velocity = Vector3.zero
 		state.hopPhase, state.gaitPhase = 0, 0
 		state.earAngle, state.earVel = 0, 0
+		-- vaihda animaatio moodin mukaan
+		if state.enabled then
+			playModeAnim(state.mode)
+		end
 		updateModeButtons()
 		if specialBtn then specialBtn.Text = modeInfo().special end
 		if ascendBtn then ascendBtn.Text = "^\n" .. modeInfo().up end
