@@ -324,7 +324,7 @@ local function poseHeli(base, t)
 	local torsoCF = base
 		* CFrame.new(0, 0.5, -1.0)
 		* CFrame.Angles(math.rad(-90) + tilt, 0, 0)
-	if crash then torsoCF = shakeCF(0.08, 0.07) * torsoCF end
+	if crash then torsoCF = torsoCF * shakeCF(0.08, 0.07) end
 	if isR15 then
 		P.torso.CFrame = torsoCF
 		P.lowerTorso.CFrame = torsoCF * CFrame.new(0, -0.55, 0.05)
@@ -597,6 +597,11 @@ RunService.Heartbeat:Connect(function(dt)
 	state.elapsed = state.elapsed + dt
 	local t = state.elapsed
 
+	-- pakota pelin animaatiot pois myos taalla (Animate pyrkii
+	-- palaamaan framessa; Stepped-luuppi tekee saman ennen fysiikkaa)
+	stopAnimations()
+	if humanoid.Sit then humanoid.Sit = false end
+
 	local md = humanoid.MoveDirection
 	local flat = Vector3.new(md.X, 0, md.Z)
 	local upInput = state.upHeld or humanoid.Jump
@@ -784,6 +789,7 @@ RunService.Stepped:Connect(function()
 
 	stopAnimations()
 	if humanoid.Sit then humanoid.Sit = false end
+	if humanoid.SeatPart then humanoid.Sit = false end
 
 	local base = P.hrp.CFrame
 	if not validCF(base) then return end
