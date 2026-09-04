@@ -3,20 +3,25 @@ Iha hullu säännöt edelleen 1 ei tiivistelyjä placebo fake koodia keskeneräi
 
 ## MorphLabFE.lua
 
-FE-skripti, joka muuttaa oman hahmosi neljaksi eri olennoksi. Ei luo uusia parteja - raajat asetetaan uusiin paikkoihin joka frame, joten kaikki pelaajat nakevat sen (100% FE). Toimii R6:lla (ensisijainen) ja R15:lla (varavirta raajaketjuilla).
+FE-skripti, joka muuttaa oman hahmosi neljaksi eri olennoksi. Ei luo uusia parteja (100% FE, kaikki pelaajat nakevat).
+
+### Tekniikka (sama kuin Robloxin animaatioissa)
+1. Motor6D-liitosten C0-arvot asetetaan poseen. Luajan omistamat liitokset replikoituvat automaattisesti.
+2. Fysiikan solveri sijoittaa osat itse liitosten mukaan -> ei fysiikkataistelua, ei flingia.
+3. Lentoon BodyVelocity + yaw-only BodyGyro (sama kaava kuin toimivassa FE-drone-referenssissa).
+4. Jointit nollataan ensin kun moodi vaihtuu / skripti kaynnistyy, pose otetaan kayttoon seuraavassa framessa.
 
 ### Moodit
-- HELICOPTER: runko makuulla, paa=ohjaamo, o.kasi=masto selasta ylos, o.jalka=paapotkuri, v.kasi=hantapuomi, v.jalka=hantapotkuri. ASCEND=nousu (paapotkuri kihahtaa), DESCEND=lasku (potkurit hiljenevat), eteenpain=nokka kallistuu + hantapotkuri kiihtyy. Special: CRASHOUT.
-- BUNNY: kadet=korvat jousitettuina (reagoivat kiihtyvyyteen), jalat=potkujalat, pomppufysiikka squash & stretch -efektilla. HOP=iso pomppu, DUCK=kyykky. Special: THUMP.
-- DOG: neljajalkainen, vinottainen rava-askel. LEAP=karkaus, SIT=istuminen. Special: BOW.
-- MONSTER: raskas keinuva hahmo, pitkat kadet. POUND=iskema, CROUCH=kuperkeikko. Special: ROAR.
+- HELICOPTER: runko makuulle (root-joint), paa=ohjaamo, o.kasi=masto, o.jalka=paapotkuri (pyorii), v.kasi=hantapuomi, v.jalka=hantapotkuri. Special: CRASHOUT.
+- BUNNY: kadet=jousitetut korvat, jalat=potkujalat, pomppufysiikka squash & stretch. Special: THUMP.
+- DOG: neljajalkainen vaakatasossa, vinottainen rava-askel, lorskahdus. Special: BOW.
+- MONSTER: kumartunut keinuva hahmo, pitkat kadet. Special: ROAR.
 
 ### Ohjaus
 - WASD / joystick = ohjaa suuntaa (leijuu paikallaan ilman inputtia)
-- ASCEND- ja DESCEND-napit ilmestyvat hypynapin viereen (PC:lla myos SPACE / CTRL)
-- Lattia-raycast estaa maan lapi uppoamisen - laskeutuminen pysahtyy maahan
+- ASCEND / DESCEND -napit hypynapin viereen (PC:lla SPACE / CTRL)
+- Lattia-raycast: laskeutuminen pysahtyy maahan
 
 ### GUI (englanniksi, ei emojeita)
 - Lapinakyva, raahattava, pienennettava (-), suljettava (X, RightShift avaa)
-- Moodivalinnat pill-painikkeina, ENABLE/DISABLE, SPECIAL-efekti
-- Reaaliaikainen status: moodi, nopeus, rotori/hop %
+- Moodipillit, ENABLE/DISABLE, SPECIAL-efekti, statusrivi
